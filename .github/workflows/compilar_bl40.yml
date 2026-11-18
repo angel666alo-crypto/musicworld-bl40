@@ -1,0 +1,37 @@
+name: Compilar BL40
+on:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Unir el paquete de recursos (subido en partes por el limite de 25 MB de GitHub)
+        run: |
+          A=app/src/main/assets
+          cat $A/bl40_assets.pack.parte* > $A/bl40_assets.pack
+          rm -f $A/bl40_assets.pack.parte*
+          ls -l $A
+      - name: Instalar SDK, NDK y CMake de Android
+        run: |
+          export ANDROID_HOME="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" "platforms;android-35" "ndk;25.2.9519653" "cmake;3.22.1"
+          sudo apt-get update && sudo apt-get install -y ninja-build
+      - name: Compilar
+        run: |
+          export ANDROID_HOME="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          bash compilar_ubuntu.sh
+      - name: Medir nucleo (antes/despues)
+        run: bash tools/medir_nucleo.sh 3000
+        continue-on-error: true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MusicWorld_BL40_APK
+          path: salida/MusicWorld_BL40.apk
