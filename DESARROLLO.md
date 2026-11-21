@@ -38,3 +38,22 @@ Las pruebas de carga basadas en distribuciones anteriores son sintéticas y no d
 - `bash tools/medir_nucleo.sh` compara en PC antes/despues y falla si el hash de fotogramas difiere. Ejecutalo tras cambiar de version de WABT o del `bl40_core.wasm`.
 - El informe (`nativeStats` / LOG JSON) incluye `tickHistogram`, `heavyTickAvgMs`, `coreCpuLoadPercent` y el bloque `device` (modelo, SoC, hilos, estado termico).
 - Siguiente paso de mayor impacto: sustituir el interprete ARM por un JIT (Dynarmic) o reducir el trabajo de dibujado del huesped; ambos requieren el codigo fuente del nucleo.
+
+## Audio: musica que no se detiene en Game Over (v3)
+
+- El juego no emite ningun evento de "parar musica" hacia el anfitrion (el contador de servicios de sonido no cambia al pausar/cambiar de cancion en el JukeBox); solo se capturan MIDI completos al iniciarse. La parada se deduce por heuristica de cambio de escena, que dependia de un toque, y el Game Over aparece sin tocar.
+- `checkPassiveGameplayScene()` (native_engine.cpp): dentro de una partida (>=80 recursos abiertos) compara la pantalla con la de hace ~400 ms; si cambia >=40 % de las 450 muestras con diferencia media >=0,55, anuncia cambio de escena (con 4 s de enfriamiento). Sobre una grabacion real, el juego normal no lo dispara y el Game Over si (~0,56 / 0,83).
+- Contador nuevo en el informe: `passiveGameplayScenes`. Sin verificar aun en telefono.
+
+## Afinidad de CPU (v3)
+
+- `pinCoreThreadToFastCores()` limita el hilo del nucleo a los nucleos con >=75 % de la frecuencia maxima (lee `cpufreq/cpuinfo_max_freq`); si no hay acceso o la CPU es homogenea no cambia nada. El informe incluye `coreAffinityMask`.
+- PGO se probo en PC (perfil del menu/JukeBox): solo ~5-8 % y con riesgo de romper la compilacion con otro clang; descartado.
+
+## Atajo de copia ARM (v4)
+`tools/optimizar_c.py` tambien inserta `bl40_hle_copy32` en `step`: el bucle del firmware en 0x1fd50
+(ldmcs/stmcs x2, subcss #32, bcs) se ejecuta por bloques con memcpy, dejando siempre la ultima
+iteracion al interprete. Solo actua con MMU/ventanas apagadas, ARM, alineado y sin solape; en cualquier otra
+situacion devuelve 0 y se interpreta normal. Verificado: hash de 3666 fotogramas identico en 15000 ticks
+(dos escenarios); la memoria difiere en una sola palabra (un puntero de contexto guardado, por el punto
+exacto de cambio de hilo). Menu: 0.81 s -> 0.56 s. Si el patron no se encuentra, se compila sin el atajo.
