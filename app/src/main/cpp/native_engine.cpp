@@ -205,6 +205,12 @@ struct State {
  std::array<uint16_t,450> sceneCandidatePixels{};
  // Guest thread publishes the scene; AudioTrack observes it using acquire.
  std::atomic<uint64_t> sceneEpoch{0},sceneTriggerMs{0},sceneChanges{0};
+ // Deteccion pasiva de fin de partida (Game Over / resultados): solo hilo del nucleo.
+ std::array<std::array<uint16_t,450>,5> passiveRing{};
+ uint64_t passiveRingAt[5]={0,0,0,0,0};
+ int passiveRingN=0;uint64_t passiveNextProbeMs=0,passiveCooldownUntilMs=0;
+ std::atomic<uint64_t> passiveScenes{0};
+ std::atomic<uint64_t> coreAffinityMask{0};
  uint64_t audioSeenSceneEpoch=0; // AudioTrack thread only (under audioMutex).
  std::atomic<uint64_t> sceneMusicStops{0},musicReplacements{0},finishedTrackStops{0};
  std::atomic<uint64_t> midiIdentified{0},midiUnknownClassifications{0},audioSceneFlushes{0};
@@ -433,6 +439,45 @@ static void checkIntroAutomaticScene(){
  announceScene(now,conservativeCutoff,"intro-automatica");
 }
 
+// El juego NO avisa al anfitrion cuando termina la musica (no hay evento de parada en la interfaz del
+// huesped), y pantallas como "Game Over" aparecen sin que el jugador toque: el detector por toque no las
+// ve y la musica del nivel seguia sonando. Heuristica estricta SOLO dentro de una partida (muchos recursos
+// abiertos): si la pantalla cambia casi por completo respecto a hace ~400 ms, se anuncia un cambio de
+// escena. Medido sobre una grabacion real: el juego normal no supera 0.35 de cambio; el Game Over da ~0.55.
+static void checkPassiveGameplayScene(){
+ const uint64_t now=g.virtualMs.load(std::memory_order_relaxed);
+ if(now<g.passiveNextProbeMs)return;
+ g.passiveNextProbeMs=now+100;
+ std::array<uint16_t,450> cur{};
+ if(!sceneSample(cur))return;
+ // anillo de las ultimas 5 muestras (una cada 100 ms)
+ if(g.passiveRingN<5){g.passiveRing[g.passiveRingN]=cur;g.passiveRingAt[g.passiveRingN]=now;g.passiveRingN++;}
+ else{
+  const std::array<uint16_t,450> ref=g.passiveRing[1]; // ~400 ms atras
+  const uint64_t refAt=g.passiveRingAt[1];
+  for(int i=0;i<4;i++){g.passiveRing[i]=g.passiveRing[i+1];g.passiveRingAt[i]=g.passiveRingAt[i+1];}
+  g.passiveRing[4]=cur;g.passiveRingAt[4]=now;
+  if((uint32_t)invoke("bl40_pc_open_count")<80)return;       // no estamos en una partida
+  if(g.sceneCandidateActive||now<g.passiveCooldownUntilMs)return;
+  double sum=0;int changed=0;
+  for(size_t i=0;i<cur.size();i++){
+   const uint16_t a=ref[i],b=cur[i];
+   const double d=std::abs((int)(a>>11)-(int)(b>>11))/31.0
+     +std::abs((int)((a>>5)&63)-(int)((b>>5)&63))/63.0
+     +std::abs((int)(a&31)-(int)(b&31))/31.0;
+   sum+=d;if(d>0.5)changed++;
+  }
+  const double fraction=(double)changed/cur.size(),avg=sum/cur.size();
+  if(fraction>=0.40&&avg>=0.55){
+   g.passiveCooldownUntilMs=now+4000;
+   g.passiveScenes++;
+   const uint64_t trigger=(now>350)?now-350:0;
+   (void)refAt;
+   announceScene(now,trigger,"pasiva-en-partida");
+  }
+ }
+}
+
 static void midiParserLoop(){
  while(true){
   MidiJob job;
@@ -523,11 +568,34 @@ static void sampleGuestCounters(){
 // V1.6: monotonic absolute deadline with NO discarded backlog.
 // A slow guest tick is followed by the next real tick immediately; it never
 // triggers a new artificial sleep. The guest still executes every 10ms tick.
+// En telefonos big.LITTLE el planificador puede dejar el hilo del nucleo en un nucleo lento. Se limita a
+// los nucleos de mayor frecuencia (>=75 % de la maxima). Todo es opcional: si no se puede leer la
+// frecuencia o fallar la llamada, el hilo queda como estaba. Devuelve la mascara aplicada (0 = sin cambio).
+static unsigned long pinCoreThreadToFastCores(id_t tid){
+ long freq[32]={0};long maxf=0;int n=0;
+ for(;n<32;n++){
+  char path[96];snprintf(path,sizeof path,"/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq",n);
+  FILE* f=fopen(path,"r");if(!f)break;
+  long v=0;if(fscanf(f,"%ld",&v)!=1)v=0;fclose(f);freq[n]=v;if(v>maxf)maxf=v;
+ }
+ if(n<4||maxf<=0)return 0;
+ unsigned long mask=0;int fast=0,slow=0;
+ for(int i=0;i<n;i++){if(freq[i]*4>=maxf*3){mask|=1UL<<i;fast++;}else slow++;}
+ if(slow==0||fast<2)return 0; // todos iguales o un solo nucleo rapido: no tocar
+ if(syscall(SYS_sched_setaffinity,(pid_t)tid,sizeof(mask),&mask)!=0)return 0;
+ return mask;
+}
 static void coreLoop(){
  bl40_native_enter_guest_thread();
  const auto tid=(id_t)syscall(SYS_gettid);
  if(setpriority(PRIO_PROCESS,tid,-4)!=0)
   INFO("Prioridad de hilo host: permiso denegado; guest sin cambios");
+ {
+  const unsigned long m=pinCoreThreadToFastCores(tid);
+  g.coreAffinityMask.store((uint64_t)m,std::memory_order_relaxed);
+  if(m)INFO("Hilo del nucleo fijado a los nucleos rapidos: mascara=0x%lx",m);
+  else INFO("Hilo del nucleo sin fijar a nucleos (CPU homogenea o sin acceso)");
+ }
  bl40perf::Hint perfHint;
  if(perfHint.start((int32_t)tid,10000000LL))INFO("ADPF activo en el hilo del nucleo (objetivo 10 ms)");
  else INFO("ADPF no disponible; el hilo del nucleo usa planificacion normal");
@@ -674,6 +742,7 @@ static void coreLoop(){
   g.audioClockCv.notify_one();
   if((g.tickCount.load(std::memory_order_relaxed)&3u)==0){
    checkSceneCandidate();
+   checkPassiveGameplayScene();
    // V1.9: passive intro fingerprint disabled pending a verified guest IPC event;
    // it was capable of stopping audio on an animation rather than a menu.
   }
@@ -753,6 +822,7 @@ static bool boot(AAssetManager* mgr){
  g.midiParseErrors=0;g.guestMidiCaptured=0;
  g.sceneCandidateActive=false;g.sceneCandidateAtMs=0;g.sceneCandidateFiles=0;
  g.sceneEpoch=0;g.sceneTriggerMs=0;g.sceneChanges=0;g.audioSeenSceneEpoch=0;
+ g.passiveRingN=0;g.passiveNextProbeMs=0;g.passiveCooldownUntilMs=0;g.passiveScenes=0;
  g.sceneMusicStops=0;g.musicReplacements=0;g.finishedTrackStops=0;
  g.midiIdentified=0;g.midiUnknownClassifications=0;g.audioSceneFlushes=0;
  g.channelControllerResets=0;g.deferredMidiStarts=0;g.duplicateBackgroundIgnored=0;g.sceneStopsFlushed=0;
@@ -1291,6 +1361,8 @@ static std::string diagnostic(){
  }
  o<<"],\n";
  o<<"  \"sceneEpoch\": "<<g.sceneEpoch.load()<<",\n";
+ o<<"  \"passiveGameplayScenes\": "<<g.passiveScenes.load()<<",\n";
+ o<<"  \"coreAffinityMask\": "<<g.coreAffinityMask.load()<<",\n";
  o<<"  \"sceneChanges\": "<<g.sceneChanges.load()<<",\n";
  o<<"  \"sceneMusicStops\": "<<g.sceneMusicStops.load()<<",\n";
  o<<"  \"musicReplacements\": "<<g.musicReplacements.load()<<",\n";
